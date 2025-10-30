@@ -1,45 +1,39 @@
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, File, UploadFile
 from fastapi.responses import JSONResponse
-import tempfile, requests, os
+import requests, fitz, io
 
-APPS_SCRIPT_URL = os.getenv(
-    "APPS_SCRIPT_URL",
-    "https://script.google.com/macros/s/AKfycbworDCQI5JQKjhuLyGhG3rOs85V8h8dBgy5MK4D0bz16zhTwu9CyLDoxCGE1JLn8lk/exec"
-)
-API_KEY = os.getenv("SUBI_API_KEY", "SUBI-12345")
+app = FastAPI(title="Subi OCR API", version="2.0")
 
-app = FastAPI(title="Subi OCR API", version="1.0")
+# 🧩 1. Nhận nhiều ảnh, gộp thành 1 PDF
+def merge_images_to_pdf(files):
+    pdf = fitz.open()
+    for f in files:
+        image_data = f.file.read()
+        img = fitz.open(stream=image_data, filetype=f.content_type.split('/')[-1])
+        rect = img[0].rect
+        pdf_bytes = io.BytesIO()
+        page = pdf.new_page(width=rect.width, height=rect.height)
+        page.show_pdf_page(rect, img, 0)
+    output = io.BytesIO()
+    pdf.save(output)
+    pdf.close()
+    output.seek(0)
+    return output
 
-# --- OCR giả lập (sẽ thay bằng olmOCR thật sau) ---
-def ocr_to_text(file_path: str) -> str:
-    return "Giấy chứng nhận CN 123456, địa chỉ 75 Tô Hiệu, Phú Thọ Hoà, diện tích 62,4 m²."
-
-@app.post("/ocr")
-async def ocr_and_fill(file: UploadFile = File(...), mode: str = "ocrText"):
-    suffix = os.path.splitext(file.filename or "")[1] or ".pdf"
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        tmp.write(await file.read())
-        tmp_path = tmp.name
-
+# 🧩 2. Endpoint nhận nhiều ảnh
+@app.post("/ocrMulti")
+async def ocr_multi(files: list[UploadFile] = File(...)):
     try:
-        text_output = ocr_to_text(tmp_path)
+        pdf_data = merge_images_to_pdf(files)
 
-        if mode == "ocrText":
-            payload = {"ocrText": text_output}
+        # gửi PDF qua Google Apps Script để OCR
+        apps_script_url = "https://script.google.com/macros/s/AKfycbworDCQI5JQKjhuLyGhG3rOs85V8h8dBgy5MK4D0bz16zhTwu9CyLDoxCGE1JLn8lk/exec"
+        res = requests.post(apps_script_url, files={"file": ("merged.pdf", pdf_data, "application/pdf")}, timeout=120)
+
+        if res.status_code == 200:
+            return JSONResponse(content={"ok": True, "source": "Render→AppsScript", "data": res.json()})
         else:
-            payload = {
-                "placeholders": {"04":"Nguyễn Văn A","20.1":"CN 123456"},
-                "options": {}
-            }
+            return JSONResponse(content={"ok": False, "error": f"Google Apps Script error {res.status_code}", "text": res.text})
 
-        headers = {"x-api-key": API_KEY}
-        resp = requests.post(APPS_SCRIPT_URL, json=payload, headers=headers, timeout=120)
-
-        try:
-            data = resp.json()
-        except Exception:
-            data = {"raw": resp.text}
-
-        return JSONResponse({"ok": True, "apps_script_response": data})
     except Exception as e:
-        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+        return JSONResponse(content={"ok": False, "error": str(e)})
